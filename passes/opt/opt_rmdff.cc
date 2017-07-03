@@ -41,9 +41,27 @@ void remove_init_attr(SigSpec sig)
 
 bool handle_dlatch(RTLIL::Module *mod, RTLIL::Cell *dlatch)
 {
-	SigSpec sig_e = dlatch->getPort("\\EN");
+	SigSpec sig_e;
+	State on_state, off_state;
 
-	if (sig_e == State::S0)
+	if (dlatch->type == "$dlatch") {
+		sig_e = assign_map(dlatch->getPort("\\EN"));
+		on_state = dlatch->getParam("\\EN_POLARITY").as_bool() ? State::S1 : State::S0;
+		off_state = dlatch->getParam("\\EN_POLARITY").as_bool() ? State::S0 : State::S1;
+	} else
+	if (dlatch->type == "$_DLATCH_P_") {
+		sig_e = assign_map(dlatch->getPort("\\E"));
+		on_state = State::S1;
+		off_state = State::S0;
+	} else
+	if (dlatch->type == "$_DLATCH_N_") {
+		sig_e = assign_map(dlatch->getPort("\\E"));
+		on_state = State::S0;
+		off_state = State::S1;
+	} else
+		log_abort();
+
+	if (sig_e == off_state)
 	{
 		RTLIL::Const val_init;
 		for (auto bit : dff_init_map(dlatch->getPort("\\Q")))
@@ -52,7 +70,7 @@ bool handle_dlatch(RTLIL::Module *mod, RTLIL::Cell *dlatch)
 		goto delete_dlatch;
 	}
 
-	if (sig_e == State::S1)
+	if (sig_e == on_state)
 	{
 		mod->connect(dlatch->getPort("\\Q"), dlatch->getPort("\\D"));
 		goto delete_dlatch;
@@ -72,7 +90,11 @@ bool handle_dff(RTLIL::Module *mod, RTLIL::Cell *dff)
 	RTLIL::SigSpec sig_d, sig_q, sig_c, sig_r;
 	RTLIL::Const val_cp, val_rp, val_rv;
 
-	if (dff->type == "$_DFF_N_" || dff->type == "$_DFF_P_") {
+	if (dff->type == "$_FF_") {
+		sig_d = dff->getPort("\\D");
+		sig_q = dff->getPort("\\Q");
+	}
+	else if (dff->type == "$_DFF_N_" || dff->type == "$_DFF_P_") {
 		sig_d = dff->getPort("\\D");
 		sig_q = dff->getPort("\\Q");
 		sig_c = dff->getPort("\\C");
@@ -89,6 +111,10 @@ bool handle_dff(RTLIL::Module *mod, RTLIL::Cell *dff)
 		val_cp = RTLIL::Const(dff->type[6] == 'P', 1);
 		val_rp = RTLIL::Const(dff->type[7] == 'P', 1);
 		val_rv = RTLIL::Const(dff->type[8] == '1', 1);
+	}
+	else if (dff->type == "$ff") {
+		sig_d = dff->getPort("\\D");
+		sig_q = dff->getPort("\\Q");
 	}
 	else if (dff->type == "$dff") {
 		sig_d = dff->getPort("\\D");
@@ -121,7 +147,7 @@ bool handle_dff(RTLIL::Module *mod, RTLIL::Cell *dff)
 		val_init.bits.push_back(bit.wire == NULL ? bit.data : RTLIL::State::Sx);
 	}
 
-	if (dff->type == "$dff" && mux_drivers.has(sig_d)) {
+	if (dff->type.in("$ff", "$dff") && mux_drivers.has(sig_d)) {
 		std::set<RTLIL::Cell*> muxes;
 		mux_drivers.find(sig_d, muxes);
 		for (auto mux : muxes) {
@@ -138,7 +164,7 @@ bool handle_dff(RTLIL::Module *mod, RTLIL::Cell *dff)
 		}
 	}
 
-	if (sig_c.is_fully_const() && (!sig_r.size() || !has_init || val_init == val_rv)) {
+	if (!sig_c.empty() && sig_c.is_fully_const() && (!sig_r.size() || !has_init || val_init == val_rv)) {
 		if (val_rv.bits.size() == 0)
 			val_rv = val_init;
 		mod->connect(sig_q, val_rv);
@@ -218,7 +244,9 @@ struct OptRmdffPass : public Pass {
 			{
 				if (wire->attributes.count("\\init") != 0) {
 					Const initval = wire->attributes.at("\\init");
-					dff_init_map.add(wire, initval);
+					for (int i = 0; i < GetSize(initval) && i < GetSize(wire); i++)
+						if (initval[i] == State::S0 || initval[i] == State::S1)
+							dff_init_map.add(SigBit(wire, i), initval[i]);
 					for (int i = 0; i < GetSize(wire); i++) {
 						SigBit wire_bit(wire, i), mapped_bit = assign_map(wire_bit);
 						if (mapped_bit.wire) {
@@ -254,13 +282,13 @@ struct OptRmdffPass : public Pass {
 				if (!design->selected(module, cell))
 					continue;
 
-				if (cell->type.in("$_DFF_N_", "$_DFF_P_",
+				if (cell->type.in("$_FF_", "$_DFF_N_", "$_DFF_P_",
 						"$_DFF_NN0_", "$_DFF_NN1_", "$_DFF_NP0_", "$_DFF_NP1_",
 						"$_DFF_PN0_", "$_DFF_PN1_", "$_DFF_PP0_", "$_DFF_PP1_",
-						"$dff", "$adff"))
+						"$ff", "$dff", "$adff"))
 					dff_list.push_back(cell->name);
 
-				if (cell->type == "$dlatch")
+				if (cell->type.in("$dlatch", "$_DLATCH_P_", "$_DLATCH_N_"))
 					dlatch_list.push_back(cell->name);
 			}
 

@@ -685,19 +685,40 @@ bool AstNode::simplify(bool const_fold, bool at_zero, bool in_lvalue, int stage,
 		current_scope.clear();
 
 	// convert defparam nodes to cell parameters
-	if (type == AST_DEFPARAM && !str.empty()) {
-		size_t pos = str.rfind('.');
+	if (type == AST_DEFPARAM && !children.empty())
+	{
+		if (children[0]->type != AST_IDENTIFIER)
+			log_error("Module name in defparam at %s:%d contains non-constant expressions!\n", filename.c_str(), linenum);
+
+		string modname, paramname = children[0]->str;
+
+		size_t pos = paramname.rfind('.');
+
+		while (pos != 0 && pos != std::string::npos)
+		{
+			modname = paramname.substr(0, pos);
+
+			if (current_scope.count(modname))
+				break;
+
+			pos = paramname.rfind('.', pos - 1);
+		}
+
 		if (pos == std::string::npos)
-			log_error("Defparam `%s' does not contain a dot (module/parameter separator) at %s:%d!\n",
-					RTLIL::unescape_id(str).c_str(), filename.c_str(), linenum);
-		std::string modname = str.substr(0, pos), paraname = "\\" + str.substr(pos+1);
-		if (current_scope.count(modname) == 0 || current_scope.at(modname)->type != AST_CELL)
-			log_error("Can't find cell for defparam `%s . %s` at %s:%d!\n", RTLIL::unescape_id(modname).c_str(), RTLIL::unescape_id(paraname).c_str(), filename.c_str(), linenum);
-		AstNode *cell = current_scope.at(modname), *paraset = clone();
+			log_error("Can't find object for defparam `%s` at %s:%d!\n", RTLIL::unescape_id(paramname).c_str(), filename.c_str(), linenum);
+
+		paramname = "\\" + paramname.substr(pos+1);
+
+		if (current_scope.at(modname)->type != AST_CELL)
+			log_error("Defparam argument `%s . %s` does not match a cell at %s:%d!\n",
+					RTLIL::unescape_id(modname).c_str(), RTLIL::unescape_id(paramname).c_str(), filename.c_str(), linenum);
+
+		AstNode *paraset = new AstNode(AST_PARASET, children[1]->clone(), GetSize(children) > 2 ? children[2]->clone() : NULL);
+		paraset->str = paramname;
+
+		AstNode *cell = current_scope.at(modname);
 		cell->children.insert(cell->children.begin() + 1, paraset);
-		paraset->type = AST_PARASET;
-		paraset->str = paraname;
-		str.clear();
+		delete_children();
 	}
 
 	// resolve constant prefixes
@@ -1062,6 +1083,15 @@ bool AstNode::simplify(bool const_fold, bool at_zero, bool in_lvalue, int stage,
 		did_something = true;
 	}
 
+	// check for local objects in unnamed block
+	if (type == AST_BLOCK && str.empty())
+	{
+		for (size_t i = 0; i < children.size(); i++)
+			if (children[i]->type == AST_WIRE || children[i]->type == AST_MEMORY || children[i]->type == AST_PARAMETER || children[i]->type == AST_LOCALPARAM)
+				log_error("Local declaration in unnamed block at %s:%d is an unsupported SystemVerilog feature!\n",
+						children[i]->filename.c_str(), children[i]->linenum);
+	}
+
 	// transform block with name
 	if (type == AST_BLOCK && !str.empty())
 	{
@@ -1070,7 +1100,7 @@ bool AstNode::simplify(bool const_fold, bool at_zero, bool in_lvalue, int stage,
 
 		std::vector<AstNode*> new_children;
 		for (size_t i = 0; i < children.size(); i++)
-			if (children[i]->type == AST_WIRE || children[i]->type == AST_PARAMETER || children[i]->type == AST_LOCALPARAM) {
+			if (children[i]->type == AST_WIRE || children[i]->type == AST_MEMORY || children[i]->type == AST_PARAMETER || children[i]->type == AST_LOCALPARAM) {
 				children[i]->simplify(false, false, false, stage, -1, false, false);
 				current_ast_mod->children.push_back(children[i]);
 				current_scope[children[i]->str] = children[i];
@@ -1370,7 +1400,7 @@ bool AstNode::simplify(bool const_fold, bool at_zero, bool in_lvalue, int stage,
 	}
 skip_dynamic_range_lvalue_expansion:;
 
-	if (stage > 1 && (type == AST_ASSERT || type == AST_ASSUME) && current_block != NULL)
+	if (stage > 1 && (type == AST_ASSERT || type == AST_ASSUME || type == AST_LIVE || type == AST_FAIR || type == AST_COVER) && current_block != NULL)
 	{
 		std::stringstream sstr;
 		sstr << "$formal$" << filename << ":" << linenum << "$" << (autoidx++);
@@ -1432,7 +1462,7 @@ skip_dynamic_range_lvalue_expansion:;
 		goto apply_newNode;
 	}
 
-	if (stage > 1 && (type == AST_ASSERT || type == AST_ASSUME) && children.size() == 1)
+	if (stage > 1 && (type == AST_ASSERT || type == AST_ASSUME || type == AST_LIVE || type == AST_FAIR || type == AST_COVER) && children.size() == 1)
 	{
 		children.push_back(mkconst_int(1, false, 1));
 		did_something = true;
@@ -1510,6 +1540,7 @@ skip_dynamic_range_lvalue_expansion:;
 		}
 
 		int mem_width, mem_size, addr_bits;
+		bool mem_signed = children[0]->id2ast->is_signed;
 		children[0]->id2ast->meminfo(mem_width, mem_size, addr_bits);
 
 		int data_range_left = children[0]->id2ast->children[0]->range_left;
@@ -1529,6 +1560,7 @@ skip_dynamic_range_lvalue_expansion:;
 
 		AstNode *wire_data = new AstNode(AST_WIRE, new AstNode(AST_RANGE, mkconst_int(mem_width-1, true), mkconst_int(0, true)));
 		wire_data->str = id_data;
+		wire_data->is_signed = mem_signed;
 		current_ast_mod->children.push_back(wire_data);
 		current_scope[wire_data->str] = wire_data;
 		while (wire_data->simplify(true, false, false, 1, -1, false, false)) { }
@@ -1807,8 +1839,8 @@ skip_dynamic_range_lvalue_expansion:;
 				goto apply_newNode;
 			}
 
-			// $anyconst is mapped in AstNode::genRTLIL()
-			if (str == "\\$anyconst") {
+			// $anyconst and $anyseq are mapped in AstNode::genRTLIL()
+			if (str == "\\$anyconst" || str == "\\$anyseq") {
 				recursion_counter--;
 				return false;
 			}
@@ -1841,7 +1873,8 @@ skip_dynamic_range_lvalue_expansion:;
 			if (str == "\\$ln" || str == "\\$log10" || str == "\\$exp" || str == "\\$sqrt" || str == "\\$pow" ||
 					str == "\\$floor" || str == "\\$ceil" || str == "\\$sin" || str == "\\$cos" || str == "\\$tan" ||
 					str == "\\$asin" || str == "\\$acos" || str == "\\$atan" || str == "\\$atan2" || str == "\\$hypot" ||
-					str == "\\$sinh" || str == "\\$cosh" || str == "\\$tanh" || str == "\\$asinh" || str == "\\$acosh" || str == "\\$atanh")
+					str == "\\$sinh" || str == "\\$cosh" || str == "\\$tanh" || str == "\\$asinh" || str == "\\$acosh" || str == "\\$atanh" ||
+					str == "\\$rtoi" || str == "\\$itor")
 			{
 				bool func_with_two_arguments = str == "\\$pow" || str == "\\$atan2" || str == "\\$hypot";
 				double x = 0, y = 0;
@@ -1878,29 +1911,34 @@ skip_dynamic_range_lvalue_expansion:;
 					y = children[1]->asReal(child_sign_hint);
 				}
 
-				newNode = new AstNode(AST_REALVALUE);
-				if (str == "\\$ln")         newNode->realvalue = ::log(x);
-				else if (str == "\\$log10") newNode->realvalue = ::log10(x);
-				else if (str == "\\$exp")   newNode->realvalue = ::exp(x);
-				else if (str == "\\$sqrt")  newNode->realvalue = ::sqrt(x);
-				else if (str == "\\$pow")   newNode->realvalue = ::pow(x, y);
-				else if (str == "\\$floor") newNode->realvalue = ::floor(x);
-				else if (str == "\\$ceil")  newNode->realvalue = ::ceil(x);
-				else if (str == "\\$sin")   newNode->realvalue = ::sin(x);
-				else if (str == "\\$cos")   newNode->realvalue = ::cos(x);
-				else if (str == "\\$tan")   newNode->realvalue = ::tan(x);
-				else if (str == "\\$asin")  newNode->realvalue = ::asin(x);
-				else if (str == "\\$acos")  newNode->realvalue = ::acos(x);
-				else if (str == "\\$atan")  newNode->realvalue = ::atan(x);
-				else if (str == "\\$atan2") newNode->realvalue = ::atan2(x, y);
-				else if (str == "\\$hypot") newNode->realvalue = ::hypot(x, y);
-				else if (str == "\\$sinh")  newNode->realvalue = ::sinh(x);
-				else if (str == "\\$cosh")  newNode->realvalue = ::cosh(x);
-				else if (str == "\\$tanh")  newNode->realvalue = ::tanh(x);
-				else if (str == "\\$asinh") newNode->realvalue = ::asinh(x);
-				else if (str == "\\$acosh") newNode->realvalue = ::acosh(x);
-				else if (str == "\\$atanh") newNode->realvalue = ::atanh(x);
-				else log_abort();
+				if (str == "\\$rtoi") {
+					newNode = AstNode::mkconst_int(x, true);
+				} else {
+					newNode = new AstNode(AST_REALVALUE);
+					if (str == "\\$ln")         newNode->realvalue = ::log(x);
+					else if (str == "\\$log10") newNode->realvalue = ::log10(x);
+					else if (str == "\\$exp")   newNode->realvalue = ::exp(x);
+					else if (str == "\\$sqrt")  newNode->realvalue = ::sqrt(x);
+					else if (str == "\\$pow")   newNode->realvalue = ::pow(x, y);
+					else if (str == "\\$floor") newNode->realvalue = ::floor(x);
+					else if (str == "\\$ceil")  newNode->realvalue = ::ceil(x);
+					else if (str == "\\$sin")   newNode->realvalue = ::sin(x);
+					else if (str == "\\$cos")   newNode->realvalue = ::cos(x);
+					else if (str == "\\$tan")   newNode->realvalue = ::tan(x);
+					else if (str == "\\$asin")  newNode->realvalue = ::asin(x);
+					else if (str == "\\$acos")  newNode->realvalue = ::acos(x);
+					else if (str == "\\$atan")  newNode->realvalue = ::atan(x);
+					else if (str == "\\$atan2") newNode->realvalue = ::atan2(x, y);
+					else if (str == "\\$hypot") newNode->realvalue = ::hypot(x, y);
+					else if (str == "\\$sinh")  newNode->realvalue = ::sinh(x);
+					else if (str == "\\$cosh")  newNode->realvalue = ::cosh(x);
+					else if (str == "\\$tanh")  newNode->realvalue = ::tanh(x);
+					else if (str == "\\$asinh") newNode->realvalue = ::asinh(x);
+					else if (str == "\\$acosh") newNode->realvalue = ::acosh(x);
+					else if (str == "\\$atanh") newNode->realvalue = ::atanh(x);
+					else if (str == "\\$itor")  newNode->realvalue = x;
+					else log_abort();
+				}
 				goto apply_newNode;
 			}
 
@@ -2135,7 +2173,7 @@ skip_dynamic_range_lvalue_expansion:;
 		}
 
 		for (auto child : decl->children)
-			if (child->type == AST_WIRE || child->type == AST_PARAMETER || child->type == AST_LOCALPARAM)
+			if (child->type == AST_WIRE || child->type == AST_MEMORY || child->type == AST_PARAMETER || child->type == AST_LOCALPARAM)
 			{
 				AstNode *wire = nullptr;
 
@@ -2145,9 +2183,16 @@ skip_dynamic_range_lvalue_expansion:;
 					if (wire->children.empty()) {
 						for (auto c : child->children)
 							wire->children.push_back(c->clone());
-					} else {
-						if (!child->children.empty())
+					} else if (!child->children.empty()) {
+						while (child->simplify(true, false, false, stage, -1, false, false)) { }
+						if (GetSize(child->children) == GetSize(wire->children)) {
+							for (int i = 0; i < GetSize(child->children); i++)
+								if (*child->children.at(i) != *wire->children.at(i))
+									goto tcall_incompatible_wires;
+						} else {
+					tcall_incompatible_wires:
 							log_error("Incompatible re-declaration of wire %s at %s:%d.\n", child->str.c_str(), filename.c_str(), linenum);
+						}
 					}
 				}
 				else
@@ -2195,7 +2240,7 @@ skip_dynamic_range_lvalue_expansion:;
 		}
 
 		for (auto child : decl->children)
-			if (child->type != AST_WIRE && child->type != AST_PARAMETER && child->type != AST_LOCALPARAM)
+			if (child->type != AST_WIRE && child->type != AST_MEMORY && child->type != AST_PARAMETER && child->type != AST_LOCALPARAM)
 			{
 				AstNode *stmt = child->clone();
 				stmt->replace_ids(prefix, replace_rules);
@@ -2658,7 +2703,7 @@ void AstNode::expand_genblock(std::string index_var, std::string prefix, std::ma
 			std::string new_name = prefix[0] == '\\' ? prefix.substr(1) : prefix;
 			size_t pos = child->str.rfind('.');
 			if (pos == std::string::npos)
-				pos = child->str[0] == '\\' ? 1 : 0;
+				pos = child->str[0] == '\\' && prefix[0] == '\\' ? 1 : 0;
 			else
 				pos = pos + 1;
 			new_name = child->str.substr(0, pos) + new_name + child->str.substr(pos);
@@ -2894,6 +2939,7 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 		std::string id_addr = sstr.str() + "_ADDR", id_data = sstr.str() + "_DATA";
 
 		int mem_width, mem_size, addr_bits;
+		bool mem_signed = children[0]->id2ast->is_signed;
 		children[0]->id2ast->meminfo(mem_width, mem_size, addr_bits);
 
 		AstNode *wire_addr = new AstNode(AST_WIRE, new AstNode(AST_RANGE, mkconst_int(addr_bits-1, true), mkconst_int(0, true)));
@@ -2906,6 +2952,7 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 		AstNode *wire_data = new AstNode(AST_WIRE, new AstNode(AST_RANGE, mkconst_int(mem_width-1, true), mkconst_int(0, true)));
 		wire_data->str = id_data;
 		wire_data->is_reg = true;
+		wire_data->is_signed = mem_signed;
 		wire_data->attributes["\\nosync"] = AstNode::mkconst_int(1, false);
 		mod->children.push_back(wire_data);
 		while (wire_data->simplify(true, false, false, 1, -1, false, false)) { }
@@ -2967,6 +3014,7 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 			std::string id_addr = sstr.str() + "_ADDR", id_data = sstr.str() + "_DATA";
 
 			int mem_width, mem_size, addr_bits;
+			bool mem_signed = id2ast->is_signed;
 			id2ast->meminfo(mem_width, mem_size, addr_bits);
 
 			AstNode *wire_addr = new AstNode(AST_WIRE, new AstNode(AST_RANGE, mkconst_int(addr_bits-1, true), mkconst_int(0, true)));
@@ -2980,6 +3028,7 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 			AstNode *wire_data = new AstNode(AST_WIRE, new AstNode(AST_RANGE, mkconst_int(mem_width-1, true), mkconst_int(0, true)));
 			wire_data->str = id_data;
 			wire_data->is_reg = true;
+			wire_data->is_signed = mem_signed;
 			if (block)
 				wire_data->attributes["\\nosync"] = AstNode::mkconst_int(1, false);
 			mod->children.push_back(wire_data);
@@ -3037,6 +3086,8 @@ bool AstNode::mem2reg_as_needed_pass2(pool<AstNode*> &mem2reg_set, AstNode *mod,
 
 		if (bit_part_sel)
 			children.push_back(bit_part_sel);
+
+		did_something = true;
 	}
 
 	log_assert(id2ast == NULL || mem2reg_set.count(id2ast) == 0);

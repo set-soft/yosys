@@ -23,6 +23,7 @@ YOSYS_NAMESPACE_BEGIN
 
 static bool read_next_line(char *&buffer, size_t &buffer_size, int &line_count, std::istream &f)
 {
+	string strbuf;
 	int buffer_len = 0;
 	buffer[0] = 0;
 
@@ -42,14 +43,42 @@ static bool read_next_line(char *&buffer, size_t &buffer_size, int &line_count, 
 			if (buffer_len > 0 && buffer[buffer_len-1] == '\\')
 				buffer[--buffer_len] = 0;
 			line_count++;
-			if (!f.getline(buffer+buffer_len, buffer_size-buffer_len))
+			if (!std::getline(f, strbuf))
 				return false;
+			while (buffer_size-buffer_len < strbuf.size()+1) {
+				buffer_size *= 2;
+				buffer = (char*)realloc(buffer, buffer_size);
+			}
+			strcpy(buffer+buffer_len, strbuf.c_str());
 		} else
 			return true;
 	}
 }
 
-void parse_blif(RTLIL::Design *design, std::istream &f, std::string dff_name, bool run_clean, bool sop_mode)
+static std::pair<RTLIL::IdString, int> wideports_split(std::string name)
+{
+	int pos = -1;
+
+	if (name.empty() || name.back() != ']')
+		goto failed;
+
+	for (int i = 0; i+1 < GetSize(name); i++) {
+		if (name[i] == '[')
+			pos = i;
+		else if (name[i] < '0' || name[i] > '9')
+			pos = -1;
+		else if (i == pos+1 && name[i] == '0')
+			pos = -1;
+	}
+
+	if (pos >= 0)
+		return std::pair<RTLIL::IdString, int>("\\" + name.substr(0, pos), atoi(name.c_str() + pos+1)+1);
+
+failed:
+	return std::pair<RTLIL::IdString, int>("\\" + name, 0);
+}
+
+void parse_blif(RTLIL::Design *design, std::istream &f, std::string dff_name, bool run_clean, bool sop_mode, bool wideports)
 {
 	RTLIL::Module *module = nullptr;
 	RTLIL::Const *lutptr = NULL;
@@ -89,6 +118,8 @@ void parse_blif(RTLIL::Design *design, std::istream &f, std::string dff_name, bo
 
 	dict<RTLIL::IdString, RTLIL::Const> *obj_attributes = nullptr;
 	dict<RTLIL::IdString, RTLIL::Const> *obj_parameters = nullptr;
+
+	dict<RTLIL::IdString, std::pair<int, bool>> wideports_cache;
 
 	size_t buffer_size = 4096;
 	char *buffer = (char*)malloc(buffer_size);
@@ -142,7 +173,32 @@ void parse_blif(RTLIL::Design *design, std::istream &f, std::string dff_name, bo
 
 			if (!strcmp(cmd, ".end"))
 			{
+				for (auto &wp : wideports_cache)
+				{
+					auto name = wp.first;
+					int width = wp.second.first;
+					bool isinput = wp.second.second;
+
+					RTLIL::Wire *wire = module->addWire(name, width);
+					wire->port_input = isinput;
+					wire->port_output = !isinput;
+
+					for (int i = 0; i < width; i++) {
+						RTLIL::IdString other_name = name.str() + stringf("[%d]", i);
+						RTLIL::Wire *other_wire = module->wire(other_name);
+						if (other_wire) {
+							other_wire->port_input = false;
+							other_wire->port_output = false;
+							if (isinput)
+								module->connect(other_wire, SigSpec(wire, i));
+							else
+								module->connect(SigSpec(wire, i), other_wire);
+						}
+					}
+				}
+
 				module->fixup_ports();
+				wideports_cache.clear();
 
 				if (run_clean)
 				{
@@ -181,9 +237,11 @@ void parse_blif(RTLIL::Design *design, std::istream &f, std::string dff_name, bo
 				continue;
 			}
 
-			if (!strcmp(cmd, ".inputs") || !strcmp(cmd, ".outputs")) {
+			if (!strcmp(cmd, ".inputs") || !strcmp(cmd, ".outputs"))
+			{
 				char *p;
-				while ((p = strtok(NULL, " \t\r\n")) != NULL) {
+				while ((p = strtok(NULL, " \t\r\n")) != NULL)
+				{
 					RTLIL::IdString wire_name(stringf("\\%s", p));
 					RTLIL::Wire *wire = module->wire(wire_name);
 					if (wire == nullptr)
@@ -192,6 +250,14 @@ void parse_blif(RTLIL::Design *design, std::istream &f, std::string dff_name, bo
 						wire->port_input = true;
 					else
 						wire->port_output = true;
+
+					if (wideports) {
+						std::pair<RTLIL::IdString, int> wp = wideports_split(p);
+						if (wp.second > 0) {
+							wideports_cache[wp.first].first = std::max(wideports_cache[wp.first].first, wp.second);
+							wideports_cache[wp.first].second = !strcmp(cmd, ".inputs");
+						}
+					}
 				}
 				obj_attributes = nullptr;
 				obj_parameters = nullptr;
@@ -446,6 +512,8 @@ void parse_blif(RTLIL::Design *design, std::istream &f, std::string dff_name, bo
 		}
 	}
 
+	return;
+
 error:
 	log_error("Syntax error in line %d!\n", line_count);
 }
@@ -463,10 +531,15 @@ struct BlifFrontend : public Frontend {
 		log("    -sop\n");
 		log("        Create $sop cells instead of $lut cells\n");
 		log("\n");
+		log("    -wideports\n");
+		log("        Merge ports that match the pattern 'name[int]' into a single\n");
+		log("        multi-bit port 'name'.\n");
+		log("\n");
 	}
 	virtual void execute(std::istream *&f, std::string filename, std::vector<std::string> args, RTLIL::Design *design)
 	{
 		bool sop_mode = false;
+		bool wideports = false;
 
 		log_header(design, "Executing BLIF frontend.\n");
 
@@ -477,11 +550,15 @@ struct BlifFrontend : public Frontend {
 				sop_mode = true;
 				continue;
 			}
+			if (arg == "-wideports") {
+				wideports = true;
+				continue;
+			}
 			break;
 		}
 		extra_args(f, filename, args, argidx);
 
-		parse_blif(design, *f, "", true, sop_mode);
+		parse_blif(design, *f, "", true, sop_mode, wideports);
 	}
 } BlifFrontend;
 
